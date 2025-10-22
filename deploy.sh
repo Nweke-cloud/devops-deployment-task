@@ -2,10 +2,58 @@
 
 #============================================
 # DevOps Deployment Automation Script
+# HNG DevOps Internship - Stage 1
+# Automated Docker deployment with Nginx reverse proxy
 #============================================
 
 set -e
 set -o pipefail
+
+#============================================
+# CLEANUP FUNCTION
+#============================================
+
+cleanup_deployment() {
+    echo "Starting cleanup process..."
+    
+    if [ -z "$SSH_USER" ] || [ -z "$SERVER_IP" ] || [ -z "$SSH_KEY" ]; then
+        echo "Please provide SSH credentials for cleanup:"
+        read -p "SSH Username: " SSH_USER
+        read -p "Server IP: " SERVER_IP
+        read -p "SSH Key Path [~/.ssh/devops-key.pem]: " SSH_KEY
+        SSH_KEY=${SSH_KEY:-~/.ssh/devops-key.pem}
+        SSH_KEY="${SSH_KEY/#\~/$HOME}"
+    fi
+    
+    echo "Cleaning up deployment on $SSH_USER@$SERVER_IP..."
+    
+    ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash <<'CLEANUPEOF'
+echo "Stopping and removing containers..."
+sudo docker stop app-container 2>/dev/null || true
+sudo docker rm app-container 2>/dev/null || true
+
+echo "Removing Docker image..."
+sudo docker rmi devops-app:latest 2>/dev/null || true
+
+echo "Removing application files..."
+rm -rf ~/app
+
+echo "Removing Nginx configuration..."
+sudo rm -f /etc/nginx/sites-enabled/devops-app
+sudo rm -f /etc/nginx/sites-available/devops-app
+sudo systemctl reload nginx
+
+echo "Cleanup completed!"
+CLEANUPEOF
+    
+    echo "✓ All resources removed successfully"
+    exit 0
+}
+
+# Check for cleanup flag
+if [ "$1" = "--cleanup" ]; then
+    cleanup_deployment
+fi
 
 #============================================
 # CONFIGURATION
@@ -382,6 +430,10 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
+    location /health {
+        proxy_pass http://localhost:$APP_PORT/health;
+        proxy_set_header Host \$host;
+    }
 }
 CONF
 sudo sed -i "s/\\\$APP_PORT/$APP_PORT/g" /etc/nginx/sites-available/devops-app
@@ -409,6 +461,9 @@ if [ "$RESPONSE" = "200" ]; then
     success "Application is responding (HTTP $RESPONSE)"
 fi
 
+HEALTH=$(ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" "curl -s http://localhost/health")
+log "Health check: $HEALTH"
+
 log ""
 log "==================================================="
 log "DEPLOYMENT COMPLETED SUCCESSFULLY!"
@@ -425,6 +480,9 @@ log "  - Commit: $CURRENT_COMMIT"
 log "  - Server: $SSH_USER@$SERVER_IP"
 log "  - Container: app-container"
 log "  - Port: $APP_PORT → 80"
+log ""
+log "To remove all deployed resources, run:"
+log "  ./deploy.sh --cleanup"
 log ""
 log "Log: $LOG_FILE"
 log "==================================================="
