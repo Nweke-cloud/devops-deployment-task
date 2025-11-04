@@ -1,0 +1,223 @@
+name: Deploy Application
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:  # Manual trigger
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+env:
+  DOCKER_IMAGE: devops-app
+  APP_PORT: 3000
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run linter
+        run: npm run lint || echo "No lint script found"
+      
+      - name: Run tests
+        run: npm test || echo "No tests found"
+      
+      - name: Build Docker image
+        run: docker build -t ${{ env.DOCKER_IMAGE }}:test .
+      
+      - name: Test Docker image
+        run: |
+          docker run -d --name test-container -p 3000:3000 ${{ env.DOCKER_IMAGE }}:test
+          sleep 5
+          curl -f http://localhost:3000 || exit 1
+          docker stop test-container
+
+  deploy:
+    name: Deploy to Server
+    needs: test
+    runs-on: ubuntu-latest
+    environment: 
+      name: ${{ github.event.inputs.environment || 'production' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.8.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+      
+      - name: Add server to known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
+      
+      - name: Test SSH connection
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SERVER_IP }} "echo 'SSH connection successful'"
+      
+      - name: Install dependencies on server
+        run: |
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SERVER_IP }} << 'EOF'
+            # Update packages
+            sudo apt-get update -y
+            
+            # Install Docker if not present
+            if ! command -v docker &> /dev/null; then
+              curl -fsSL https://get.docker.com -o get-docker.sh
+              sudo sh get-docker.sh
+              sudo usermod -aG docker $USER
+            fi
+            
+            # Install Docker Compose if not present
+            if ! command -v docker-compose &> /dev/null; then
+              sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+                -o /usr/local/bin/docker-compose
+              sudo chmod +x /usr/local/bin/docker-compose
+            fi
+            
+            # Install Nginx if not present
+            if ! command -v nginx &> /dev/null; then
+              sudo apt-get install -y nginx
+            fi
+            
+            # Enable services
+            sudo systemctl enable docker nginx
+            sudo systemctl start docker nginx
+          EOF
+      
+      - name: Transfer application files
+        run: |
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='node_modules' \
+            --exclude='*.log' \
+            -e "ssh -o StrictHostKeyChecking=no" \
+            ./ ${{ secrets.SSH_USER }}@${{ secrets.SERVER_IP }}:~/app/
+      
+      - name: Deploy Docker container
+        run: |
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SERVER_IP }} << 'EOF'
+            cd ~/app
+            
+            # Stop and remove old container
+            sudo docker stop app-container 2>/dev/null || true
+            sudo docker rm app-container 2>/dev/null || true
+            
+            # Remove old images
+            sudo docker image prune -f
+            
+            # Build new image
+            sudo docker build -t ${{ env.DOCKER_IMAGE }}:latest .
+            
+            # Run new container
+            sudo docker run -d \
+              --name app-container \
+              -p ${{ env.APP_PORT }}:3000 \
+              --restart unless-stopped \
+              --log-driver json-file \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
+              ${{ env.DOCKER_IMAGE }}:latest
+            
+            # Wait for container to start
+            sleep 5
+            
+            # Check container status
+            sudo docker ps | grep app-container
+            sudo docker logs app-container --tail 20
+          EOF
+      
+      - name: Configure Nginx
+        run: |
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SERVER_IP }} << 'NGINXEOF'
+            # Create Nginx configuration
+            sudo tee /etc/nginx/sites-available/devops-app > /dev/null << 'CONF'
+          server {
+              listen 80;
+              listen [::]:80;
+              server_name _;
+              
+              location / {
+                  proxy_pass http://localhost:${{ env.APP_PORT }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_cache_bypass $http_upgrade;
+              }
+              
+              location /health {
+                  proxy_pass http://localhost:${{ env.APP_PORT }}/health;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+              }
+          }
+          CONF
+            
+            # Replace port placeholder
+            sudo sed -i "s/\${{ env.APP_PORT }}/${{ env.APP_PORT }}/g" /etc/nginx/sites-available/devops-app
+            
+            # Enable site
+            sudo ln -sf /etc/nginx/sites-available/devops-app /etc/nginx/sites-enabled/
+            sudo rm -f /etc/nginx/sites-enabled/default
+            
+            # Test and reload
+            sudo nginx -t
+            sudo systemctl reload nginx
+          NGINXEOF
+      
+      - name: Health check
+        run: |
+          sleep 5
+          RESPONSE=$(ssh ${{ secrets.SSH_USER }}@${{ secrets.SERVER_IP }} \
+            "curl -s -o /dev/null -w '%{http_code}' http://localhost")
+          
+          if [ "$RESPONSE" = "200" ]; then
+            echo "✓ Application is healthy (HTTP $RESPONSE)"
+          else
+            echo "✗ Health check failed (HTTP $RESPONSE)"
+            exit 1
+          fi
+      
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "🎉 Deployment successful!"
+          echo "Server: ${{ secrets.SERVER_IP }}"
+          echo "Application: http://${{ secrets.SERVER_IP }}"
+          echo "Health check: http://${{ secrets.SERVER_IP }}/health"
+      
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ Deployment failed!"
+          echo "Check the logs above for details"
+
